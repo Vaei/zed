@@ -43,8 +43,9 @@ struct ExplorerCommandInjector;
 #[allow(non_snake_case)]
 impl IExplorerCommand_Impl for ExplorerCommandInjector_Impl {
     fn GetTitle(&self, _: Ref<IShellItemArray>) -> Result<windows_core::PWSTR> {
-        let command_description =
-            retrieve_command_description().unwrap_or(HSTRING::from("Open with Zed"));
+        let command_description = retrieve_command_description()
+            .map(|title| HSTRING::from(strip_accelerator_markers(&title.to_string_lossy())))
+            .unwrap_or(HSTRING::from("Open with Zed"));
         unsafe { SHStrDupW(&command_description) }
     }
 
@@ -178,6 +179,24 @@ fn get_zed_exe_path() -> Option<String> {
 }
 
 #[inline]
+/// The registry title carries a classic-menu access key (`Z&ed`), which the Windows 11 menu
+/// shows literally. `&&` is an escaped ampersand and stays as one.
+fn strip_accelerator_markers(title: &str) -> String {
+    let mut result = String::with_capacity(title.len());
+    let mut chars = title.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '&' {
+            if chars.peek() == Some(&'&') {
+                chars.next();
+                result.push('&');
+            }
+        } else {
+            result.push(character);
+        }
+    }
+    result
+}
+
 fn retrieve_command_description() -> Result<HSTRING> {
     const REG_PATH: &str = cfg_select! {
         feature = "stable" => { r#"Software\Classes\ZedContextMenu"# },

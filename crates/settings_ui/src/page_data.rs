@@ -9493,6 +9493,29 @@ fn ai_page(cx: &App) -> SettingsPage {
                 files: USER,
             }),
             SettingsPageItem::SettingItem(SettingItem {
+                title: "Collapse Tool Output After",
+                description: "Tool output longer than this many characters starts collapsed. Click it to expand or collapse. 0 never collapses.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.collapse_tool_output_chars"),
+                    pick: |settings_content| {
+                        settings_content
+                            .agent
+                            .as_ref()?
+                            .collapse_tool_output_chars
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .collapse_tool_output_chars = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
                 title: "Terminal Thread Init Command",
                 description: "Command to automatically run when Zed creates a Terminal Thread shell in the agent panel. Runs in your configured shell.",
                 field: Box::new(SettingField {

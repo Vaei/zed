@@ -288,12 +288,14 @@ impl RenderOnce for ThreadItem {
         let icon_container = || {
             h_flex()
                 .id(icon_id.clone())
-                .size_4()
+                .size_6()
                 .flex_none()
                 .justify_center()
                 .when(!icon_visible, |this| this.invisible())
         };
         let icon_color = self.icon_color.unwrap_or(Color::Muted);
+        // Large enough to read a thread's state from across the room.
+        let status_icon_size = IconSize::Custom(rems_from_px(20.));
         let agent_icon = if let Some(icon_char) = self.icon_char {
             Label::new(icon_char)
                 .size(LabelSize::Small)
@@ -302,37 +304,37 @@ impl RenderOnce for ThreadItem {
         } else if let Some(custom_svg) = self.custom_icon_from_external_svg {
             Icon::from_external_svg(custom_svg)
                 .color(icon_color)
-                .size(IconSize::Small)
+                .size(status_icon_size)
                 .into_any_element()
         } else {
             Icon::new(self.icon)
                 .color(icon_color)
-                .size(IconSize::Small)
+                .size(status_icon_size)
                 .into_any_element()
         };
 
         let status_icon = if self.status == AgentThreadStatus::Error {
             Some(
                 Icon::new(IconName::Close)
-                    .size(IconSize::Small)
+                    .size(status_icon_size)
                     .color(Color::Error),
             )
         } else if self.status == AgentThreadStatus::WaitingForConfirmation {
             Some(
                 Icon::new(IconName::Warning)
-                    .size(IconSize::XSmall)
+                    .size(status_icon_size)
                     .color(Color::Warning),
             )
         } else if self.status == AgentThreadStatus::Unconfirmed {
             Some(
                 Icon::new(IconName::Info)
-                    .size(IconSize::Small)
+                    .size(status_icon_size)
                     .color(Color::Muted),
             )
         } else if self.notified {
             Some(
                 Icon::new(IconName::Circle)
-                    .size(IconSize::Small)
+                    .size(status_icon_size)
                     .color(Color::Accent),
             )
         } else {
@@ -343,8 +345,8 @@ impl RenderOnce for ThreadItem {
             icon_container()
                 .child(
                     Icon::new(IconName::LoadCircle)
-                        .size(IconSize::Small)
-                        .color(Color::Muted)
+                        .size(status_icon_size)
+                        .color(Color::Accent)
                         .with_rotate_animation(2),
                 )
                 .into_any_element()

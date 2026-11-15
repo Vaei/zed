@@ -760,6 +760,9 @@ pub struct ThreadView {
     pub list_state: ListState,
     pub session_capabilities: SharedSessionCapabilities,
     pub expanded_tool_call_raw_inputs: HashSet<acp_v2::ToolCallId>,
+    /// Long tool outputs the user expanded past the `collapse_tool_output_chars` limit, keyed by
+    /// tool call and content index.
+    expanded_long_outputs: HashSet<(acp_v2::ToolCallId, usize)>,
     collapsed_sandbox_authorization_details: HashSet<acp_v2::ToolCallId>,
     collapsed_sandbox_network_details: HashSet<acp_v2::ToolCallId>,
     /// Sandbox escalation prompts whose "surprising Unicode" warning the user
@@ -814,6 +817,7 @@ pub struct ThreadView {
     dismissed_skill_loading_issues: HashSet<SkillLoadingIssue>,
     pub(crate) thread_search_bar: Option<Entity<super::thread_search_bar::ThreadSearchBar>>,
     pub(crate) thread_search_visible: bool,
+    prompt_history_cursor: Option<PromptHistoryCursor>,
 }
 impl Focusable for ThreadView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -1295,6 +1299,7 @@ impl ThreadView {
             last_token_limit_telemetry: None,
             thread_feedback: Default::default(),
             expanded_tool_call_raw_inputs: HashSet::default(),
+            expanded_long_outputs: HashSet::default(),
             collapsed_sandbox_authorization_details: HashSet::default(),
             collapsed_sandbox_network_details: HashSet::default(),
             acknowledged_confusable_warnings: HashSet::default(),
@@ -1336,6 +1341,7 @@ impl ThreadView {
             dismissed_skill_loading_issues: HashSet::default(),
             thread_search_bar: None,
             thread_search_visible: false,
+            prompt_history_cursor: None,
         };
 
         this.sync_reported_activity(cx);
@@ -1443,6 +1449,9 @@ impl ThreadView {
         cx: &mut Context<Self>,
     ) {
         match command {
+            PromptLocalCommand::Clear => {
+                window.dispatch_action(crate::NewThread.boxed_clone(), cx);
+            }
             PromptLocalCommand::ThumbsUp => {
                 self.handle_feedback_click(ThreadFeedback::Positive, window, cx);
                 self.show_local_command_toast("Thanks for your feedback!", cx);
@@ -2221,7 +2230,7 @@ impl ThreadView {
             return;
         }
 
-        if is_generating {
+        if is_generating && !thread.read(cx).accepts_prompts_while_running() {
             cx.emit(AcpThreadViewEvent::Interacted);
             self.queue_message(message_editor, window, cx);
             return;
@@ -2954,7 +2963,9 @@ impl ThreadView {
             id,
             content,
             tracked_buffers,
-            steer: false,
+            // Steer by default, so a message sent mid-turn reaches the agent at its next
+            // boundary instead of waiting for the whole turn to finish.
+            steer: true,
             editor,
             _subscription: subscription,
         });
@@ -5554,6 +5565,86 @@ impl ThreadView {
         )
     }
 
+    /// Pins the latest prompt above the conversation once it scrolls out of view, so a glance
+    /// at any thread shows what it was asked to do. Clicking it scrolls back to the prompt.
+    fn render_last_prompt_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let thread = self.thread.read(cx);
+        let (prompt_ix, message) =
+            thread
+                .entries()
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(ix, entry)| match entry {
+                    AgentThreadEntry::UserMessage(message) => Some((ix, message)),
+                    _ => None,
+                })?;
+
+        let scroll_top = self.list_state.logical_scroll_top();
+        let prompt_fully_visible = scroll_top.item_ix < prompt_ix
+            || (scroll_top.item_ix == prompt_ix && scroll_top.offset_in_item <= px(0.));
+        if prompt_fully_visible {
+            return None;
+        }
+
+        let full_text = message.content.to_markdown(cx);
+        let full_text = full_text.trim();
+        if full_text.is_empty() {
+            return None;
+        }
+        let summary: String = full_text
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(300)
+            .collect();
+        let tooltip_text: SharedString = full_text.chars().take(2000).collect::<String>().into();
+        let max_content_width = AgentSettings::get_global(cx).max_content_width;
+
+        Some(
+            h_flex()
+                .id("last-prompt-banner")
+                .w_full()
+                .flex_shrink_0()
+                .border_b_1()
+                .border_color(cx.theme().colors().border_variant)
+                .bg(cx.theme().colors().editor_background.opacity(0.2))
+                .hover(|style| style.bg(cx.theme().colors().element_hover))
+                .cursor_pointer()
+                .child(
+                    h_flex()
+                        .w_full()
+                        .min_w_0()
+                        .when_some(max_content_width, |this, max_w| this.max_w(max_w).mx_auto())
+                        .px_2()
+                        .py_1()
+                        .gap_1p5()
+                        .child(
+                            Icon::new(IconName::ArrowUp)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            Label::new(summary)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .single_line()
+                                .truncate(),
+                        ),
+                )
+                .tooltip(Tooltip::text(tooltip_text))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.list_state.scroll_to(ListOffset {
+                        item_ix: prompt_ix,
+                        offset_in_item: px(0.),
+                    });
+                    cx.notify();
+                }))
+                .into_any_element(),
+        )
+    }
+
     pub(crate) fn render_message_editor(
         &mut self,
         window: &mut Window,
@@ -5999,6 +6090,7 @@ impl ThreadView {
         };
 
         let used = crate::humanize_token_count(usage.used_tokens);
+        let used_label = used.clone();
         let max = crate::humanize_token_count(usage.max_tokens);
         let input_tokens_label = crate::humanize_token_count(usage.input_tokens);
         let output_tokens_label = crate::humanize_token_count(usage.output_tokens);
@@ -6153,6 +6245,12 @@ impl ThreadView {
                     .id("circular_progress_tokens")
                     .mt_px()
                     .mr_1()
+                    .gap_1()
+                    .child(
+                        Label::new(used_label)
+                            .size(LabelSize::Small)
+                            .color(token_count_color(usage.used_tokens, cx)),
+                    )
                     .child(
                         CircularProgress::new(
                             usage.used_tokens as f32,
@@ -8306,6 +8404,10 @@ impl ThreadView {
     fn available_local_commands(&self, cx: &App) -> Vec<PromptLocalCommand> {
         let mut commands = Vec::new();
 
+        if self.parent_session_id.is_none() {
+            commands.push(PromptLocalCommand::Clear);
+        }
+
         if self.is_thread_feedback_enabled(cx) {
             commands.push(PromptLocalCommand::ThumbsUp);
             commands.push(PromptLocalCommand::ThumbsDown);
@@ -8498,7 +8600,88 @@ impl ThreadView {
                 offset_in_item: px(0.),
             });
             cx.notify();
+        } else {
+            // Past the last prompt, the bottom of the chat is the final stop in the cycle.
+            self.scroll_to_end(cx);
         }
+    }
+
+    fn previous_prompt_in_history(
+        &mut self,
+        _: &PreviousPromptInHistory,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.step_prompt_history(true, window, cx);
+    }
+
+    fn next_prompt_in_history(
+        &mut self,
+        _: &NextPromptInHistory,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.step_prompt_history(false, window, cx);
+    }
+
+    /// Recalls sent prompts into the message editor. Only takes over while the editor is empty
+    /// or still showing an unedited recalled prompt, so a draft is never replaced; otherwise the
+    /// key falls through to normal cursor movement.
+    fn step_prompt_history(
+        &mut self,
+        backwards: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current_text = self.message_editor.read(cx).text(cx);
+        let browsing_from = self
+            .prompt_history_cursor
+            .as_ref()
+            .filter(|cursor| cursor.recalled_text == current_text)
+            .map(|cursor| cursor.entry_ix);
+        if browsing_from.is_none() {
+            self.prompt_history_cursor = None;
+            if !backwards || !current_text.is_empty() {
+                cx.propagate();
+                return;
+            }
+        }
+
+        let thread = self.thread.read(cx);
+        let entries = thread.entries();
+        let is_prompt =
+            |ix: &usize| matches!(entries.get(*ix), Some(AgentThreadEntry::UserMessage(_)));
+        let target_ix = match (browsing_from, backwards) {
+            (None, _) => (0..entries.len()).rev().find(is_prompt),
+            (Some(from), true) => (0..from).rev().find(is_prompt),
+            (Some(from), false) => (from + 1..entries.len()).find(is_prompt),
+        };
+
+        let Some(target_ix) = target_ix else {
+            if !backwards {
+                self.prompt_history_cursor = None;
+                self.message_editor.update(cx, |editor, cx| {
+                    editor.set_message(Vec::new(), window, cx);
+                });
+            }
+            return;
+        };
+        let Some(AgentThreadEntry::UserMessage(message)) = entries.get(target_ix) else {
+            return;
+        };
+        let blocks = message.content.source_blocks().to_vec();
+
+        let recalled_text = self.message_editor.update(cx, |editor, cx| {
+            editor.set_message(blocks, window, cx);
+            // Keeping the caret at the start keeps the editor in `start_of_input`, so the next
+            // Up or Down keeps stepping through history instead of moving between lines.
+            editor.set_cursor_offset(0, window, cx);
+            editor.text(cx)
+        });
+        self.prompt_history_cursor = Some(PromptHistoryCursor {
+            entry_ix: target_ix,
+            recalled_text,
+        });
     }
 
     fn refresh_thread_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -9558,6 +9741,25 @@ impl ThreadView {
                             } else {
                                 terminal_view.into_any_element()
                             };
+                            let (char_count, line_count) = match output {
+                                Some(output) => {
+                                    (output.original_content_len, output.content_line_count)
+                                }
+                                None => {
+                                    let current = terminal_data.current_output(cx).output;
+                                    (current.len(), current.lines().count())
+                                }
+                            };
+                            // Keyed past any content index so a terminal never shares expansion
+                            // state with a markdown output of the same tool call.
+                            let element = self.render_collapsible_output(
+                                &tool_call.id,
+                                usize::MAX,
+                                char_count,
+                                line_count,
+                                element,
+                                cx,
+                            );
 
                             div()
                                 .on_action(cx.listener(|_this, _: &NewTerminal, window, cx| {
@@ -12209,6 +12411,10 @@ impl ThreadView {
         cx: &Context<Self>,
     ) -> AnyElement {
         let markdown_style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+        let (char_count, line_count) = {
+            let source = markdown.read(cx).source();
+            (source.len(), source.lines().count())
+        };
         let output = self
             .render_numbered_read_file_output(
                 markdown.clone(),
@@ -12222,6 +12428,14 @@ impl ThreadView {
                 self.render_markdown(markdown, markdown_style, cx)
                     .into_any()
             });
+        let output = self.render_collapsible_output(
+            &tool_call.id,
+            context_ix,
+            char_count,
+            line_count,
+            output,
+            cx,
+        );
 
         v_flex()
             .gap_2()
@@ -12241,6 +12455,85 @@ impl ThreadView {
             .text_xs()
             .text_color(cx.theme().colors().text_muted)
             .child(output)
+            .into_any_element()
+    }
+
+    /// Clips output longer than the `collapse_tool_output_chars` setting to a few lines until
+    /// the user clicks it, so long tool results don't push the conversation around.
+    fn render_collapsible_output(
+        &self,
+        tool_call_id: &acp_v2::ToolCallId,
+        content_ix: usize,
+        char_count: usize,
+        line_count: usize,
+        output: AnyElement,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let limit = AgentSettings::get_global(cx).collapse_tool_output_chars;
+        if limit == 0 || char_count <= limit {
+            return output;
+        }
+
+        let key = (tool_call_id.clone(), content_ix);
+        let is_expanded = self.expanded_long_outputs.contains(&key);
+        let element_id =
+            SharedString::from(format!("collapsible-output-{tool_call_id}-{content_ix}"));
+        let toggle =
+            move |this: &mut Self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
+                if !this.expanded_long_outputs.remove(&key) {
+                    this.expanded_long_outputs.insert(key.clone());
+                }
+                cx.notify();
+            };
+
+        let footer_label = if is_expanded {
+            SharedString::from("Collapse")
+        } else {
+            SharedString::from(format!("Show all {line_count} lines"))
+        };
+        let footer = h_flex()
+            .id(SharedString::from(format!("{element_id}-toggle")))
+            .w_full()
+            .py_0p5()
+            .gap_1()
+            .justify_center()
+            .rounded_sm()
+            .cursor_pointer()
+            .hover(|style| style.bg(cx.theme().colors().element_hover))
+            .child(
+                Icon::new(if is_expanded {
+                    IconName::ChevronUp
+                } else {
+                    IconName::ChevronDown
+                })
+                .size(IconSize::XSmall)
+                .color(Color::Muted),
+            )
+            .child(
+                Label::new(footer_label)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .on_click(cx.listener(toggle.clone()));
+
+        v_flex()
+            .w_full()
+            .map(|this| {
+                if is_expanded {
+                    this.child(output)
+                } else {
+                    this.child(
+                        div()
+                            .id(element_id)
+                            .max_h(rems(8.))
+                            .overflow_hidden()
+                            .cursor_pointer()
+                            .on_click(cx.listener(toggle))
+                            .child(output),
+                    )
+                }
+            })
+            .child(footer)
             .into_any_element()
     }
 
@@ -14140,6 +14433,8 @@ impl Render for ThreadView {
             .on_action(cx.listener(Self::scroll_output_to_bottom))
             .on_action(cx.listener(Self::scroll_output_to_previous_message))
             .on_action(cx.listener(Self::scroll_output_to_next_message))
+            .on_action(cx.listener(Self::previous_prompt_in_history))
+            .on_action(cx.listener(Self::next_prompt_in_history))
             .on_action(cx.listener(Self::toggle_search))
             .on_action(cx.listener(|this, _: &ToggleFastMode, window, cx| {
                 this.toggle_fast_mode(window, cx);
@@ -14331,6 +14626,9 @@ impl Render for ThreadView {
                     .flatten(),
                 |this, bar| this.child(bar),
             )
+            .when(has_messages && self.parent_session_id.is_none(), |this| {
+                this.children(self.render_last_prompt_banner(cx))
+            })
             .child(conversation)
             .children(self.render_multi_root_callout(cx))
             .children(self.render_activity_bar(window, cx))
@@ -14361,6 +14659,27 @@ impl Render for ThreadView {
             .children(self.render_request_elicitations(cx))
             .child(self.render_message_editor(window, cx))
     }
+}
+
+/// Escalates from muted to yellow, orange and red as the thread's context grows, independent of
+/// the model's window size. Orange is a blend of the theme's warning and error colours.
+fn token_count_color(used_tokens: u64, cx: &App) -> Color {
+    let status = cx.theme().status();
+    match used_tokens {
+        tokens if tokens > 500_000 => Color::Error,
+        tokens if tokens > 350_000 => {
+            Color::Custom(status.warning.blend(status.error.opacity(0.5)))
+        }
+        tokens if tokens > 200_000 => Color::Warning,
+        _ => Color::Muted,
+    }
+}
+
+/// Which sent prompt the message editor is showing while stepping through history, and the
+/// text it was given, so any edit since ends the browse.
+struct PromptHistoryCursor {
+    entry_ix: usize,
+    recalled_text: String,
 }
 
 pub(crate) fn open_link(

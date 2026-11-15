@@ -4458,6 +4458,15 @@ impl AcpThread {
         }
     }
 
+    /// Whether the agent acknowledges prompts on receipt, so one can be submitted while a turn is
+    /// still running and the agent folds it into its work.
+    pub fn accepts_prompts_while_running(&self) -> bool {
+        matches!(
+            self.submissions.transport(),
+            SubmissionTransport::Receipt(_)
+        )
+    }
+
     /// Whether the agent reports this session's foreground state, rather than Zed
     /// deriving it from its own prompt turns.
     pub fn uses_reported_activity(&self) -> bool {
@@ -5032,6 +5041,22 @@ impl AcpThread {
         }
 
         false
+    }
+
+    /// Whether any tool call in the whole thread is still running, including terminals and
+    /// subagents left going in the background after their turn ended.
+    pub fn has_unfinished_tool_work(&self, cx: &App) -> bool {
+        self.entries.iter().any(|entry| match entry {
+            AgentThreadEntry::ToolCall(call) => {
+                matches!(
+                    call.status(),
+                    ToolCallStatus::InProgress | ToolCallStatus::Pending
+                ) || call
+                    .terminals()
+                    .any(|terminal| terminal.read(cx).output().is_none())
+            }
+            _ => false,
+        })
     }
 
     pub fn used_tools_since_last_user_message(&self) -> bool {
@@ -8710,8 +8735,15 @@ impl AcpThread {
                 status,
             } => {
                 let terminal_id = acp_v2::TerminalId::new(terminal_id.0);
-                if let Some(entity) = self.terminals.get(&terminal_id) {
+                if let Some(entity) = self.terminals.get(&terminal_id).cloned() {
                     entity.update(cx, |term, cx| term.finish_display(status, cx));
+                    let owning_entry_ix = self
+                        .entries
+                        .iter()
+                        .position(|entry| entry.terminals().any(|terminal| *terminal == entity));
+                    if let Some(entry_ix) = owning_entry_ix {
+                        cx.emit(AcpThreadEvent::EntryUpdated(entry_ix));
+                    }
                 } else {
                     self.pending_terminal_exit
                         .entry(terminal_id)

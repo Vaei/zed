@@ -2439,8 +2439,8 @@ impl Sidebar {
                         this.when(has_running_threads, |this| {
                             this.child(
                                 Icon::new(IconName::LoadCircle)
-                                    .size(IconSize::XSmall)
-                                    .color(Color::Muted)
+                                    .size(IconSize::Custom(rems_from_px(20.)))
+                                    .color(Color::Accent)
                                     .with_rotate_animation(2),
                             )
                         })
@@ -2457,7 +2457,7 @@ impl Sidebar {
                                     .id(format!("{id_prefix}waiting-indicator-{ix}"))
                                     .child(
                                         Icon::new(IconName::Warning)
-                                            .size(IconSize::XSmall)
+                                            .size(IconSize::Custom(rems_from_px(20.)))
                                             .color(Color::Warning),
                                     )
                                     .tooltip(Tooltip::text(tooltip_text)),
@@ -2468,7 +2468,7 @@ impl Sidebar {
                             |this| {
                                 this.child(
                                     Icon::new(IconName::Circle)
-                                        .size(IconSize::Small)
+                                        .size(IconSize::Custom(rems_from_px(20.)))
                                         .color(Color::Accent),
                                 )
                             },
@@ -2579,19 +2579,23 @@ impl Sidebar {
             .unwrap_or_default();
         let is_menu_open = menu_handle.is_deployed();
 
-        let button = IconButton::new(
-            SharedString::from(format!("{id_prefix}project-header-new-thread-{ix}")),
-            IconName::Plus,
-        )
-        .when(!is_menu_open && !self.has_filter_query(cx), |button| {
-            let color = cx.theme().colors();
-            button
-                .hover_background(color.element_background)
-                .active_background(color.element_active)
-        })
-        .selected_style(ButtonStyle::Tinted(TintColor::Accent))
-        .icon_size(IconSize::Small)
-        .when(!is_menu_open, |this| this.visible_on_hover(group_name));
+        let has_filter_query = self.has_filter_query(cx);
+        let make_button = |id_suffix: &str, icon: IconName, cx: &App| {
+            IconButton::new(
+                SharedString::from(format!("{id_prefix}project-header-{id_suffix}-{ix}")),
+                icon,
+            )
+            .when(!is_menu_open && !has_filter_query, |button| {
+                let color = cx.theme().colors();
+                button
+                    .hover_background(color.element_background)
+                    .active_background(color.element_active)
+            })
+            .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+            .icon_size(IconSize::Small)
+            .when(!is_menu_open, |this| this.visible_on_hover(group_name))
+        };
+        let button = make_button("new-thread", IconName::Plus, cx);
 
         let open_workspaces = self
             .multi_workspace
@@ -2627,15 +2631,29 @@ impl Sidebar {
                 .into_any_element();
         }
 
+        let quick_button = open_workspaces.first().cloned().map(|workspace| {
+            let key = key.clone();
+            button
+                .tooltip(move |_, cx| {
+                    Tooltip::for_action_in("Start New Agent Thread", &NewThread, &focus_handle, cx)
+                })
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.set_group_expanded(&key, true, cx);
+                    this.selection = None;
+                    this.create_new_entry(&workspace, window, cx);
+                }))
+        });
+        let menu_button = make_button("new-thread-in", IconName::ChevronDown, cx);
+
         let this = cx.weak_entity();
         let key = key.clone();
 
-        PopoverMenu::new(SharedString::from(format!(
+        let menu = PopoverMenu::new(SharedString::from(format!(
             "{id_prefix}project-header-new-thread-menu-{ix}"
         )))
         .with_handle(menu_handle)
-        .trigger_with_tooltip(button, move |_, cx| {
-            Tooltip::for_action_in("Start New Agent Thread", &NewThread, &focus_handle, cx)
+        .trigger_with_tooltip(menu_button, move |_, cx| {
+            Tooltip::simple("New Thread In…", cx)
         })
         .anchor(gpui::Anchor::TopLeft)
         .on_open(Rc::new({
@@ -2794,8 +2812,13 @@ impl Sidebar {
         .offset(gpui::Point {
             x: px(0.),
             y: px(1.),
-        })
-        .into_any_element()
+        });
+
+        h_flex()
+            .gap_px()
+            .children(quick_button)
+            .child(menu)
+            .into_any_element()
     }
 
     // Warms `worktree_default_branches` for every project group with at least one
@@ -8146,6 +8169,9 @@ fn all_thread_infos_for_workspace(
                 match thread.status() {
                     ThreadStatus::Unconfirmed => AgentThreadStatus::Unconfirmed,
                     ThreadStatus::Generating => AgentThreadStatus::Running,
+                    ThreadStatus::Idle if thread.has_unfinished_tool_work(cx) => {
+                        AgentThreadStatus::Running
+                    }
                     ThreadStatus::Idle => AgentThreadStatus::Completed,
                 }
             };

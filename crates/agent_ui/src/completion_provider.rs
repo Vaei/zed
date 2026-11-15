@@ -197,6 +197,7 @@ impl PromptContextAction {
 /// work (see `handle_message_editor_event`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptLocalCommand {
+    Clear,
     ThumbsUp,
     ThumbsDown,
 }
@@ -204,6 +205,7 @@ pub enum PromptLocalCommand {
 impl PromptLocalCommand {
     pub fn keyword(&self) -> &'static str {
         match self {
+            Self::Clear => "clear",
             Self::ThumbsUp => "helpful",
             Self::ThumbsDown => "not-helpful",
         }
@@ -211,6 +213,7 @@ impl PromptLocalCommand {
 
     pub fn label(&self) -> &'static str {
         match self {
+            Self::Clear => "Clear",
             Self::ThumbsUp => "Positive Feedback",
             Self::ThumbsDown => "Negative Feedback",
         }
@@ -218,6 +221,7 @@ impl PromptLocalCommand {
 
     pub fn description(&self) -> &'static str {
         match self {
+            Self::Clear => "Start a new thread with an empty context.",
             Self::ThumbsUp => {
                 "Rate this response as helpful. Sends the current conversation to the Zed team."
             }
@@ -229,6 +233,7 @@ impl PromptLocalCommand {
 
     pub fn icon(&self) -> IconName {
         match self {
+            Self::Clear => IconName::Eraser,
             Self::ThumbsUp => IconName::ThumbsUp,
             Self::ThumbsDown => IconName::ThumbsDown,
         }

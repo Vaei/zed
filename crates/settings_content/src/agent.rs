@@ -361,6 +361,11 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub expand_terminal_card: Option<bool>,
+    /// Tool output longer than this many characters starts collapsed in the agent panel. Click it
+    /// to expand or collapse. 0 never collapses.
+    ///
+    /// Default: 512
+    pub collapse_tool_output_chars: Option<usize>,
     /// Command to automatically run when Zed creates a Terminal Thread shell in the agent panel.
     /// The command is sent to the shell as if typed, so it is interpreted by your
     /// configured shell (including on Windows and remote/WSL projects).

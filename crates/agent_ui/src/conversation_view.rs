@@ -96,11 +96,11 @@ use crate::{
     Agent, AgentDiffPane, AgentInitialContent, AgentPanel, AgentPanelEvent, AllowAlways, AllowOnce,
     AuthorizeToolCall, ClearMessageQueue, CycleFavoriteModels, CycleModeSelector,
     CycleThinkingEffort, EditFirstQueuedMessage, ExpandMessageEditor, Follow, KeepAll, NewThread,
-    OpenAddContextMenu, OpenAgentDiff, RejectAll, RejectOnce, RemoveFirstQueuedMessage,
-    ScrollOutputLineDown, ScrollOutputLineUp, ScrollOutputPageDown, ScrollOutputPageUp,
-    ScrollOutputToBottom, ScrollOutputToNextMessage, ScrollOutputToPreviousMessage,
-    ScrollOutputToTop, SendImmediately, SendNextQueuedMessage, ToggleFastMode,
-    ToggleProfileSelector, ToggleSteerFirstQueuedMessage, ToggleThinkingEffortMenu,
+    NextPromptInHistory, OpenAddContextMenu, OpenAgentDiff, PreviousPromptInHistory, RejectAll,
+    RejectOnce, RemoveFirstQueuedMessage, ScrollOutputLineDown, ScrollOutputLineUp,
+    ScrollOutputPageDown, ScrollOutputPageUp, ScrollOutputToBottom, ScrollOutputToNextMessage,
+    ScrollOutputToPreviousMessage, ScrollOutputToTop, SendImmediately, SendNextQueuedMessage,
+    ToggleFastMode, ToggleProfileSelector, ToggleSteerFirstQueuedMessage, ToggleThinkingEffortMenu,
     ToggleThinkingMode, UndoLastReject,
 };
 
@@ -832,6 +832,9 @@ pub struct ConversationView {
     /// Shared with the child [`ThreadView`] when one is constructed.
     pub(crate) code_span_resolver: AgentCodeSpanResolver,
     request_elicitation_form_states: HashMap<ElicitationEntryId, ElicitationFormState>,
+    /// Last seen value of the root thread's `has_unfinished_tool_work`, so its flips can be
+    /// published as metadata updates (the sidebar shows such a thread as still running).
+    root_had_unfinished_tool_work: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -1158,6 +1161,7 @@ impl ConversationView {
             draft_prompt_persist_task: None,
             code_span_resolver,
             request_elicitation_form_states: HashMap::default(),
+            root_had_unfinished_tool_work: false,
             _subscriptions: subscriptions,
             focus_handle: cx.focus_handle(),
         }
@@ -1956,8 +1960,14 @@ impl ConversationView {
             return;
         };
         let is_subagent = thread.read(cx).parent_session_id().is_some();
-        if !is_subagent && affects_thread_metadata(event) {
-            cx.emit(RootThreadUpdated);
+        if !is_subagent {
+            let has_unfinished_tool_work = thread.read(cx).has_unfinished_tool_work(cx);
+            let unfinished_work_changed =
+                has_unfinished_tool_work != self.root_had_unfinished_tool_work;
+            self.root_had_unfinished_tool_work = has_unfinished_tool_work;
+            if unfinished_work_changed || affects_thread_metadata(event) {
+                cx.emit(RootThreadUpdated);
+            }
         }
         match event {
             AcpThreadEvent::ActivityConfirmedIdle => {
