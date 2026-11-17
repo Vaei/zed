@@ -237,6 +237,22 @@ pub trait AgentConnection {
         Ok(())
     }
 
+    /// Whether `steer` can add a prompt to a turn that is still running.
+    fn supports_steering(&self) -> bool {
+        false
+    }
+
+    /// Adds a prompt to the session's running turn, so the agent reads it at its next boundary
+    /// instead of after the turn ends.
+    fn steer(
+        &self,
+        _session_id: &acp_v2::SessionId,
+        _content: Vec<acp_v2::ContentBlock>,
+        _cx: &mut App,
+    ) -> Task<Result<SteerOutcome>> {
+        Task::ready(Err(anyhow::anyhow!("Steering is not supported")))
+    }
+
     /// Receipt transports acknowledge acceptance through `receipt_submissions`
     /// instead of implementing this completion-based path.
     fn prompt(
@@ -351,6 +367,14 @@ impl dyn AgentConnection {
     pub fn downcast<T: 'static + AgentConnection + Sized>(self: Rc<Self>) -> Option<Rc<T>> {
         self.into_any().downcast().ok()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SteerOutcome {
+    /// The prompt joined the running turn.
+    Injected,
+    /// No turn was running, so nothing was sent; submit it as a new prompt instead.
+    NoRunningTurn,
 }
 
 pub trait AgentSessionTruncate {

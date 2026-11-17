@@ -13,7 +13,7 @@ use acp_thread::{
 use action_log::ActionLog;
 use agent_client_protocol::schema::{MaybeUndefined, ProtocolVersion};
 use agent_client_protocol::{
-    Agent, Client, HandleDispatchFrom, JsonRpcRequest, Lines,
+    Agent, Client, HandleDispatchFrom, JsonRpcRequest, Lines, UntypedMessage,
     v1::{Builder, ConnectionTo, Responder},
     v2::Builder as V2Builder,
 };
@@ -79,6 +79,9 @@ pub struct AcpConnection {
     auth_methods: Vec<acp_v2::AuthMethod>,
     agent_server_store: WeakEntity<AgentServerStore>,
     agent_capabilities: acp::AgentCapabilities,
+    /// Whether the agent advertised `_meta.steering.supported`, accepting `_session/steering`
+    /// requests that add a prompt to a running turn.
+    supports_steering: bool,
     /// Whether Zed advertised the subagents RFD, so the agent reports subagents with it.
     accepts_subagent_updates: bool,
     request_elicitations: Entity<ElicitationStore>,
@@ -675,6 +678,13 @@ impl AcpConnection {
             cx,
         );
 
+        let supports_steering = response
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("steering"))
+            .and_then(|steering| steering.get("supported"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         let agent_info = response.agent_info;
         let telemetry_id = agent_info
             .as_ref()
@@ -742,6 +752,7 @@ impl AcpConnection {
             sessions,
             pending_sessions: RefCell::new(HashMap::default()),
             agent_capabilities: response.agent_capabilities,
+            supports_steering,
             accepts_subagent_updates,
             request_elicitations,
             defaults,
@@ -789,6 +800,7 @@ impl AcpConnection {
             auth_methods: vec![],
             agent_server_store,
             agent_capabilities,
+            supports_steering: false,
             accepts_subagent_updates,
             request_elicitations,
             defaults,
@@ -1671,6 +1683,44 @@ impl AgentConnection for AcpConnection {
 
     fn validate_prompt_content(&self, content: &[acp_v2::ContentBlock]) -> Result<()> {
         acp_thread::content::validate_prompt_content_for_v1(content)
+    }
+
+    fn supports_steering(&self) -> bool {
+        self.supports_steering
+    }
+
+    fn steer(
+        &self,
+        session_id: &acp_v2::SessionId,
+        content: Vec<acp_v2::ContentBlock>,
+        cx: &mut App,
+    ) -> Task<Result<acp_thread::SteerOutcome>> {
+        if !self.supports_steering {
+            return Task::ready(Err(anyhow!("This agent does not support steering")));
+        }
+        let request = acp_v2::PromptRequest::new(session_id.clone(), content);
+        let mut params = match acp_thread::content::prompt_to_v1(request)
+            .and_then(|params| Ok(serde_json::to_value(params)?))
+        {
+            Ok(params) => params,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        // Without a running turn the agent would start one Zed is not tracking, so it is asked
+        // to decline instead and the caller sends a normal prompt.
+        params["_meta"] = serde_json::json!({ "steering": { "idleBehavior": "promptRequired" } });
+        let message = match UntypedMessage::new("_session/steering", params) {
+            Ok(message) => message,
+            Err(error) => return Task::ready(Err(anyhow!(error))),
+        };
+        let conn = self.connection.clone();
+        cx.foreground_executor().spawn(async move {
+            let response = conn.send_request(message).block_task().await?;
+            match response.get("outcome").and_then(serde_json::Value::as_str) {
+                Some("injected") => Ok(acp_thread::SteerOutcome::Injected),
+                Some("promptRequired") => Ok(acp_thread::SteerOutcome::NoRunningTurn),
+                other => Err(anyhow!("unexpected steering outcome: {other:?}")),
+            }
+        })
     }
 
     fn prompt(

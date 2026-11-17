@@ -5093,7 +5093,7 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
-    async fn test_queued_message_steer_defaults_off_and_toggles(cx: &mut TestAppContext) {
+    async fn test_queued_message_steer_defaults_on_and_toggles(cx: &mut TestAppContext) {
         init_test(cx);
 
         let fs = FakeFs::new(cx.executor());
@@ -5122,25 +5122,30 @@ pub(crate) mod tests {
         });
         cx.run_until_parked();
 
-        // Default: steering is off, so the message waits for end-of-generation
-        // rather than interrupting the agent at the next boundary.
+        // Default: steering is on, so the message reaches the agent at its next boundary.
         active_thread(&conversation_view, cx).read_with(cx, |thread, _cx| {
             assert!(
-                !thread.message_queue.front_wants_steer(),
-                "steering should default off"
+                thread.message_queue.front_wants_steer(),
+                "steering should default on"
             );
         });
+        assert!(native_thread.read_with(cx, |thread, _| thread.end_turn_at_next_boundary()));
 
-        assert!(!native_thread.read_with(cx, |thread, _| thread.end_turn_at_next_boundary()));
         active_thread(&conversation_view, cx).update(cx, |thread, cx| {
             thread.message_queue.toggle_steer(id);
             thread.sync_queue_flag_to_native_thread(cx);
         });
         active_thread(&conversation_view, cx).read_with(cx, |thread, _cx| {
             assert!(
-                thread.message_queue.front_wants_steer(),
-                "steering should be on after toggling"
+                !thread.message_queue.front_wants_steer(),
+                "steering should be off after toggling"
             );
+        });
+        assert!(!native_thread.read_with(cx, |thread, _| thread.end_turn_at_next_boundary()));
+
+        active_thread(&conversation_view, cx).update(cx, |thread, cx| {
+            thread.message_queue.toggle_steer(id);
+            thread.sync_queue_flag_to_native_thread(cx);
         });
         assert!(native_thread.read_with(cx, |thread, _| thread.end_turn_at_next_boundary()));
         active_thread(&conversation_view, cx).update(cx, |view, cx| {

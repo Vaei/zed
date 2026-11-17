@@ -151,7 +151,7 @@ impl RenderOnce for TerminalToolHeader {
             .theme()
             .colors()
             .element_background
-            .blend(cx.theme().colors().editor_foreground.opacity(0.025));
+            .blend(cx.theme().colors().editor_foreground.opacity(0.06));
 
         let header_row = h_flex()
             .id(child_id("header"))

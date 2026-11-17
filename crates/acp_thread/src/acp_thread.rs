@@ -4467,6 +4467,56 @@ impl AcpThread {
         )
     }
 
+    /// Whether a prompt can join the running turn through [`Self::steer`].
+    pub fn supports_steering(&self) -> bool {
+        matches!(
+            self.submissions.transport(),
+            SubmissionTransport::Completion
+        ) && self.connection.supports_steering()
+    }
+
+    /// Adds `message` to the running turn and shows it in the thread. Resolves to `false`
+    /// when no turn was running, in which case nothing was sent.
+    pub fn steer(
+        &mut self,
+        message: Vec<acp_v2::ContentBlock>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<bool>> {
+        if let Err(error) = self.validate_prompt_content(&message) {
+            return Task::ready(Err(error));
+        }
+        let steer = self
+            .connection
+            .clone()
+            .steer(self.session_id(), message.clone(), cx);
+        cx.spawn(async move |this, cx| {
+            if steer.await? == SteerOutcome::NoRunningTurn {
+                return Ok(false);
+            }
+            this.update(cx, |this, cx| {
+                let language_registry = this.project.read(cx).languages().clone();
+                let path_style = this.project.read(cx).path_style(cx);
+                let mut content = MessageContent::default();
+                for chunk in message {
+                    content.append_prompt(chunk, &language_registry, path_style, cx);
+                }
+                this.flush_streaming_text(cx);
+                this.push_entry(
+                    AgentThreadEntry::UserMessage(UserMessage {
+                        identity: MessageIdentity::Legacy(None),
+                        meta: None,
+                        client_id: None,
+                        is_optimistic: false,
+                        content,
+                        indented: false,
+                    }),
+                    cx,
+                );
+            })?;
+            Ok(true)
+        })
+    }
+
     /// Whether the agent reports this session's foreground state, rather than Zed
     /// deriving it from its own prompt turns.
     pub fn uses_reported_activity(&self) -> bool {

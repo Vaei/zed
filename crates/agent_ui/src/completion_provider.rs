@@ -221,7 +221,7 @@ impl PromptLocalCommand {
 
     pub fn description(&self) -> &'static str {
         match self {
-            Self::Clear => "Start a new thread with an empty context.",
+            Self::Clear => "Replace this thread with an empty one. The old thread moves to the archive.",
             Self::ThumbsUp => {
                 "Rate this response as helpful. Sends the current conversation to the Zed team."
             }

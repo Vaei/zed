@@ -1450,7 +1450,17 @@ impl ThreadView {
     ) {
         match command {
             PromptLocalCommand::Clear => {
+                let had_messages = !self.thread.read(cx).entries().is_empty();
+                let thread_id = self.root_thread_id;
                 window.dispatch_action(crate::NewThread.boxed_clone(), cx);
+                // Deferred so the new thread is showing before the old one leaves the list.
+                if had_messages {
+                    window.defer(cx, move |_, cx| {
+                        if let Some(store) = ThreadMetadataStore::try_global(cx) {
+                            store.update(cx, |store, cx| store.archive(thread_id, None, cx));
+                        }
+                    });
+                }
             }
             PromptLocalCommand::ThumbsUp => {
                 self.handle_feedback_click(ThreadFeedback::Positive, window, cx);
@@ -2230,14 +2240,20 @@ impl ThreadView {
             return;
         }
 
+        let text = message_editor.read(cx).text(cx);
+        let text = text.trim();
+
         if is_generating && !thread.read(cx).accepts_prompts_while_running() {
             cx.emit(AcpThreadViewEvent::Interacted);
-            self.queue_message(message_editor, window, cx);
+            // Slash commands run as their own turn, so they wait in the queue.
+            if thread.read(cx).supports_steering() && !text.starts_with('/') {
+                self.steer_message(message_editor, window, cx);
+            } else {
+                self.queue_message(message_editor, window, cx);
+            }
             return;
         }
 
-        let text = message_editor.read(cx).text(cx);
-        let text = text.trim();
         if text == "/login" || text == "/logout" {
             let connection = thread.read(cx).connection().clone();
             let can_login = connection
@@ -2919,6 +2935,49 @@ impl ThreadView {
                 cx.notify();
             })?;
             Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    /// Sends the editor's message into the running turn, like typing while the Claude Code CLI
+    /// works. Falls back to the queue when the turn has already ended or steering fails.
+    fn steer_message(
+        &mut self,
+        message_editor: Entity<MessageEditor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let contents = self.resolve_message_contents(&message_editor, cx);
+        let thread = self.thread.clone();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let (content, tracked_buffers) = contents.await?;
+            if content.is_empty() {
+                return Ok::<(), anyhow::Error>(());
+            }
+            this.update_in(cx, |this, window, cx| {
+                message_editor.update(cx, |message_editor, cx| message_editor.clear(window, cx));
+                this.clear_external_source_prompt_warning(cx);
+            })?;
+
+            let steered = thread
+                .update(cx, |thread, cx| thread.steer(content.clone(), cx))
+                .await;
+            if let Ok(true) = steered {
+                return this.update(cx, |_, cx| cx.notify());
+            }
+            if let Err(error) = &steered {
+                log::warn!("Steering failed, queueing the message instead: {error:#}");
+            }
+
+            this.update_in(cx, |this, window, cx| {
+                this.add_to_queue(content, tracked_buffers, window, cx);
+                let is_idle = this.thread.read(cx).status() == acp_thread::ThreadStatus::Idle;
+                if is_idle && let Some(id) = this.message_queue.last_id() {
+                    this.send_queued_message_now(id, window, cx);
+                }
+                cx.notify();
+            })
         })
         .detach_and_log_err(cx);
     }
@@ -5592,12 +5651,15 @@ impl ThreadView {
         if full_text.is_empty() {
             return None;
         }
+        // Blank lines are dropped so they don't spend the banner's line budget.
         let summary: String = full_text
-            .split_whitespace()
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| !line.trim().is_empty())
             .collect::<Vec<_>>()
-            .join(" ")
+            .join("\n")
             .chars()
-            .take(300)
+            .take(2000)
             .collect();
         let tooltip_text: SharedString = full_text.chars().take(2000).collect::<String>().into();
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
@@ -5617,20 +5679,24 @@ impl ThreadView {
                         .w_full()
                         .min_w_0()
                         .when_some(max_content_width, |this, max_w| this.max_w(max_w).mx_auto())
+                        .items_start()
                         .px_2()
                         .py_1()
                         .gap_1p5()
                         .child(
-                            Icon::new(IconName::ArrowUp)
-                                .size(IconSize::XSmall)
-                                .color(Color::Muted),
+                            div().h(px(22.)).flex().items_center().child(
+                                Icon::new(IconName::ArrowUp)
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted),
+                            ),
                         )
                         .child(
-                            Label::new(summary)
-                                .size(LabelSize::Small)
-                                .color(Color::Muted)
-                                .single_line()
-                                .truncate(),
+                            div().flex_1().min_w_0().child(
+                                Label::new(summary)
+                                    .size(LabelSize::Default)
+                                    .color(Color::Custom(cx.theme().colors().text.opacity(0.85)))
+                                    .line_clamp(5),
+                            ),
                         ),
                 )
                 .tooltip(Tooltip::text(tooltip_text))
@@ -8645,6 +8711,11 @@ impl ThreadView {
                 cx.propagate();
                 return;
             }
+            // Queued messages are closer than sent ones, so Up edits the newest of them first.
+            if let Some(last_id) = self.message_queue.last_id() {
+                self.move_queued_message_to_main_editor(last_id, None, None, window, cx);
+                return;
+            }
         }
 
         let thread = self.thread.read(cx);
@@ -9708,14 +9779,35 @@ impl ThreadView {
         })
         .command_slot(command_element);
 
+        let status_stripe_color = if tool_failed || command_failed {
+            cx.theme().status().error
+        } else if needs_confirmation {
+            cx.theme().status().warning
+        } else if command_finished {
+            cx.theme().status().success
+        } else {
+            cx.theme().status().info
+        };
+
         v_flex()
             .when(layout == ToolCallLayout::Standalone, |this| {
-                this.my_1p5()
+                this.relative()
+                    .my_1p5()
                     .mx_5()
+                    .pl(px(3.))
                     .border_1()
                     .when(tool_failed || command_failed, |card| card.border_dashed())
                     .border_color(border_color)
                     .rounded_md()
+                    .child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .top_0()
+                            .bottom_0()
+                            .w(px(3.))
+                            .bg(status_stripe_color),
+                    )
             })
             .overflow_hidden()
             .child(header)
